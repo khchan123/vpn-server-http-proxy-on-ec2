@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: Deploy a tunnel server supports HTTP proxy and VPN (pptp)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: HTTP-Proxy
+    Description: Environment name
+  AllowedCIDR:
+    Type: String
+    Description: CIDR allowed to connect to this EC2 instance
+    Default: 0.0.0.0/0
+  InstanceType:
+    Type: String
+    Description: EC2 instance size.
+    Default: t3a.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+      - t3a.micro
+      - t3a.small
+  ProxyPort:
+    Type: Number
+    Description: Port number for HTTP proxy
+    Default: 3128
+  VPNUser:
+    Type: String
+    Description: VPN username
+    Default: vpn
+  VPNPassword:
+    Type: String
+    Description: VPN password
+    Default: 123123123
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs
+    Description: The AMI to use for EC2 instance
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-VPC'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-IGW'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-subnet-A'
+
+  # SubnetB:
+  #   Type: AWS::EC2::Subnet
+  #   Properties:
+  #     AvailabilityZone: !Sub "${AWS::Region}b"
+  #     VpcId: !Ref VPC
+  #     CidrBlock: 10.0.1.0/24
+  #     MapPublicIpOnLaunch: true
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub '${Environment}-subnet-B'
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+
+  # SubnetBRouteTableAssociation:
+  #   Type: AWS::EC2::SubnetRouteTableAssociation
+  #   Properties:
+  #     RouteTableId: !Ref RouteTable
+  #     SubnetId: !Ref SubnetB
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${Environment}-EC2-SG'
+      GroupDescription: "Security Group for EC2 instance running squid proxy"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp:  !Sub ${AllowedCIDR}
+          FromPort: !Ref ProxyPort
+          ToPort: !Ref ProxyPort
+        - IpProtocol: tcp
+          CidrIp:  !Sub ${AllowedCIDR}
+          FromPort: 1723
+          ToPort: 1723
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-EC2-SG'
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref EC2Instance
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-EIP'
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}-EC2-${AWS::Region}-Role
+      ManagedPolicyArns:
+        -  arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: !Sub ${Environment}-EC2-${AWS::Region}-Instance-Profile
+      Path: /
+      Roles: 
+       - !Ref EC2InstanceRole
+
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType:
+        Ref: InstanceType
+      SubnetId: !Ref SubnetA
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - Ref: InstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -ex
+
+          # Update and install packages
+          yum update -y
+          yum install -y squid
+
+          # Deploy basic remaining conf to squid.conf file
+          echo "
+          request_header_access Allow allow all
+          request_header_access Accept allow all
+          request_header_access Accept-Charset allow all
+          request_header_access Accept-Encoding allow all
+          request_header_access Accept-Language allow all
+          request_header_access Authorization allow all
+          request_header_access Cache-Control allow all
+          request_header_access Connection allow all
+          request_header_access Content-Encoding allow all
+          request_header_access Content-Language allow all
+          request_header_access Content-Length allow all
+          request_header_access Content-Type allow all
+          request_header_access Cookie allow all
+          request_header_access Date allow all
+          request_header_access Expires allow all
+          request_header_access Host allow all
+          request_header_access If-Modified-Since allow all
+          request_header_access Last-Modified allow all
+          request_header_access Location allow all
+          request_header_access Mime-Version allow all
+          request_header_access Pragma allow all
+          request_header_access Proxy-Authenticate allow all
+          request_header_access Proxy-Authorization allow all
+          request_header_access Proxy-Connection allow all
+          request_header_access Retry-After allow all
+          request_header_access Title allow all
+          request_header_access User-Agent allow all
+          request_header_access WWW-Authenticate allow all
+          request_header_access All deny all
+          request_header_access X-Forwarded-For deny all
+          via off
+          forwarded_for delete
+          " | tee -a /etc/squid/squid.conf
+          sed -i -e 's|^http_access deny all|http_access allow all\nhttp_access deny all|' /etc/squid/squid.conf
+          sed -i -e 's|^http_port .*|http_port ${ProxyPort}  # 3128|' /etc/squid/squid.conf
+
+          # Start squid
+          systemctl enable squid.service
+          systemctl restart squid.service
+
+          # install pptpd
+          yum install iptables-services -y
+          yum install -y ppp
+          cd /usr/local/src
+          wget http://poptop.sourceforge.net/yum/stable/packages/pptpd-1.4.0-1.el6.x86_64.rpm
+          rpm -ivh pptpd-1.4.0-1.el6.x86_64.rpm
+
+          #sed -i 's/^net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/g' /etc/sysctl.conf
+          echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+          sysctl -p
+          sed -i 's/^logwtmp/#logwtmp/g' /etc/pptpd.conf
+          echo "localip 192.168.240.1" >> /etc/pptpd.conf
+          echo "remoteip 192.168.240.2-100" >> /etc/pptpd.conf
+          while read ns; do echo "ms-dns $ns" >> /etc/ppp/options.pptpd ; done < <(cat  /etc/resolv.conf|grep nameserver|awk -F" " '{print $2}')
+          echo "${VPNUser} pptpd ${VPNPassword} *" >> /etc/ppp/chap-secrets
+          iptables -t nat -A POSTROUTING -s 192.168.240.0/24 -j SNAT --to-source `ifconfig  | grep 'inet '| grep -v '127.0.0.1' | awk 'NR==1 { print $2}'`
+          iptables -A FORWARD -p tcp --syn -s 192.168.240.0/24 -j TCPMSS --set-mss 1356
+          service iptables save
+
+          # enable and start pptpd
+          chkconfig iptables on
+          chkconfig pptpd on
+          service iptables start
+          service pptpd start
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-EC2'
+
+Outputs:
+  ProxyServer:
+    Value:
+      Fn::GetAtt:
+        - EC2Instance
+        - PublicIp
+    Description: Proxy server IP address
+  ProxyPort:
+    Value: !Ref ProxyPort
+    Description: Proxy port
+  VPNServer:
+    Value:
+      Fn::GetAtt:
+        - EC2Instance
+        - PublicIp
+    Description: VPN server
+  VPNUser:
+    Value: !Ref VPNUser
+    Description: VPN username
+  VPNPassword:
+    Value: !Ref VPNPassword
+    Description: VPN password
